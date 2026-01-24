@@ -1,0 +1,8 @@
+24 Jan 2026
+------------
+
+-> Core database setup logic implemented.
+-> Added complete docker based implementation setup.
+-> Partial database implementation with FASTAPI.
+
+
