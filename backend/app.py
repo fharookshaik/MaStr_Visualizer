@@ -71,6 +71,7 @@ async def get_metadata(unit_type: str, conn=Depends(get_db)):
     """Returns unique values for filterable columns based on unit type."""
     table_name = TABLE_MAPPING.get(unit_type)
     if not table_name:
+        logger.error(f"No such table {table_name}")
         raise HTTPException(status_code=400, detail="Invalid unit_type")
     
     cols = FILTER_COLUMNS.get("common", []) + FILTER_COLUMNS.get(unit_type, [])
