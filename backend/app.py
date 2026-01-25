@@ -4,6 +4,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any, Optional, List
 from utils import DBConfigenv, Database
 
+from logger import logger
+
+
 # GLOBALS
 TABLE_MAPPING = {
     "solar": "solar_extended",
@@ -80,6 +83,7 @@ async def get_metadata(unit_type: str, conn=Depends(get_db)):
             metadata[col] = [r[col] for r in records]
         return metadata
     except Exception as e:
+        logger.error(f"Error getting metadata: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/tiles/{unit_type}/{z}/{x}/{y}")
@@ -119,6 +123,7 @@ async def get_tiles(
         result = await conn.fetchval(query, *params)
         return Response(content=result if result else b"", media_type="application/vnd.mapbox-vector-tile")
     except Exception as e:
+        logger.error(f"Error generating tiles: {e}")
         return Response(content=b"", media_type="application/vnd.mapbox-vector-tile")
 
 @app.get("/api/stats/advanced/{unit_type}")
@@ -162,16 +167,25 @@ async def get_advanced_stats(unit_type: str, conn=Depends(get_db)):
             "categories": {"column": cat_col, "data": [dict(r) for r in categories]}
         }
     except Exception as e:
+        logger.error(f"Error fetching advanced temporal stats: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/stats")
 async def get_basic_stats(unit_type: str, conn=Depends(get_db)):
-    table_name = TABLE_MAPPING.get(unit_type)
-    query = f'SELECT "Bundesland", COUNT(*) as count, SUM("Bruttoleistung") as total_capacity FROM "{table_name}" WHERE "Bundesland" IS NOT NULL GROUP BY "Bundesland" ORDER BY total_capacity DESC'
-    records = await conn.fetch(query)
-    return [dict(r) for r in records]
+    try:
+        table_name = TABLE_MAPPING.get(unit_type)
+        query = f'SELECT "Bundesland", COUNT(*) as count, SUM("Bruttoleistung") as total_capacity FROM "{table_name}" WHERE "Bundesland" IS NOT NULL GROUP BY "Bundesland" ORDER BY total_capacity DESC'
+        records = await conn.fetch(query)
+        return [dict(r) for r in records]
+    except Exception as e:
+        logger.error(f"Error fetching basic stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/bundeslaender")
 async def get_bundeslaender(conn=Depends(get_db)):
-    records = await conn.fetch('SELECT DISTINCT "Bundesland" FROM solar_extended WHERE "Bundesland" IS NOT NULL ORDER BY 1')
-    return [r["Bundesland"] for r in records]
+    try:
+        records = await conn.fetch('SELECT DISTINCT "Bundesland" FROM solar_extended WHERE "Bundesland" IS NOT NULL ORDER BY 1')
+        return [r["Bundesland"] for r in records]
+    except Exception as e:
+        logger.error(f"Error fetching Bundeslander: {e}")
+        raise HTTPException(status_code=500, detail=str(e))        
