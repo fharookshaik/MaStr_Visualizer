@@ -3,12 +3,17 @@ import requests
 import pandas as pd
 import pydeck as pdk
 import plotly.express as px
+import os
 
 # Page configuration
 st.set_page_config(page_title="MaStr Visualizer", layout="wide")
 # st.set_page_config(page_title="MaStr Visualizer", page_icon="⚡", layout="wide")
 
-BACKEND_URL = "http://localhost:8000"
+# Internal URL for server-to-server communication (within Docker network)
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+# External URL for browser-to-server communication (from user's machine)
+MAP_BACKEND_URL = os.getenv("MAP_BACKEND_URL", "http://localhost:8000")
+
 UNIT_TYPES = {
     "solar": "Solar", "wind": "Wind", "storage": "Storage",
     "biomass": "Biomass", "hydro": "Hydro", "combustion": "Combustion", "nuclear": "Nuclear"
@@ -56,8 +61,8 @@ def render_sidebar():
 def render_map(unit_type, filters):
     st.subheader(f"🗺️ {UNIT_TYPES[unit_type]} Spatial Distribution")
     
-    # Construct Tile URL with filters
-    tile_url = f"{BACKEND_URL}/api/tiles/{unit_type}/{{z}}/{{x}}/{{y}}"
+    # Construct Tile URL with filters using the browser-accessible URL
+    tile_url = f"{MAP_BACKEND_URL}/api/tiles/{unit_type}/{{z}}/{{x}}/{{y}}"
     if filters:
         query_str = "&".join([f"{k}={v}" for k, v in filters.items()])
         tile_url += f"?{query_str}"
@@ -81,7 +86,7 @@ def render_map(unit_type, filters):
         tooltip={"html": "<b>{Name}</b><br>ID: {EinheitMastrNummer}<br>Power: {Bruttoleistung} kW<br>Status: {EinheitBetriebsstatus}"},
         map_style="dark"
     )
-    st.pydeck_chart(deck, use_container_width=True)
+    st.pydeck_chart(deck, width='stretch')
 
 def render_dashboard(unit_type, filters):
     st.subheader(f"📊 {UNIT_TYPES[unit_type]} Insights")
@@ -109,7 +114,7 @@ def render_dashboard(unit_type, filters):
         if not df_temp.empty:
             fig = px.line(df_temp, x="year", y="capacity", labels={"capacity": "Capacity (kW)"}, template="plotly_dark")
             fig.update_traces(line_color='#FF8C00')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     with c2:
         st.markdown(f"**Top 10 by {adv['categories']['column']}**")
@@ -117,7 +122,7 @@ def render_dashboard(unit_type, filters):
         if not df_cat.empty:
             fig = px.bar(df_cat, x="capacity", y="category", orientation='h', template="plotly_dark")
             fig.update_traces(marker_color='#4B0082')
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     c3, c4 = st.columns([1, 2])
     with c3:
@@ -125,7 +130,7 @@ def render_dashboard(unit_type, filters):
         df_status = pd.DataFrame(adv["status"])
         if not df_status.empty:
             fig = px.pie(df_status, values="count", names="status", hole=.4, template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
     
     with c4:
         st.markdown("**Regional Capacity (kW)**")
