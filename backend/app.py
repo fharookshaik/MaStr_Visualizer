@@ -1,9 +1,35 @@
 from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Depends, HTTPException, Query
-from typing import Dict, Any, Optional
+from fastapi import FastAPI, Depends, HTTPException, Query, Response, Request
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, Any, Optional, List
 from utils import DBConfigenv, Database
+
 from logger import logger
+
+
+# GLOBALS
+TABLE_MAPPING = {
+    "solar": "solar_extended",
+    "wind": "wind_extended",
+    "storage": "storage_extended",
+    "biomass": "biomass_extended",
+    "hydro": "hydro_extended",
+    "combustion": "combustion_extended",
+    "nuclear": "nuclear_extended",
+}
+
+# Columns are filterable per unit type
+FILTER_COLUMNS = {
+    "common": ["Bundesland", "EinheitBetriebsstatus"],
+    "solar": ["ArtDerSolaranlage", "Lage"],
+    "wind": ["Hersteller", "WindAnLandOderAufSee"],
+    "biomass": ["Biomasseart", "Hauptbrennstoff"],
+    "storage": ["Batterietechnologie", "Einsatzort"],
+    "hydro": ["ArtDerWasserkraftanlage"],
+    "combustion": ["Hauptbrennstoff", "Technologie"],
+    "nuclear": ["Technologie"]
+}
+
 
 # Create database instance
 config = DBConfigenv()
@@ -32,91 +58,135 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def to_geojson_feature(unit, unit_type, lat_col='Breitengrad', lon_col='Laengengrad'):
-    """Converts a database record to a GeoJSON feature."""
-    if not unit or not unit.get(lat_col) or not unit.get(lon_col):
-        return None
+@app.get("/api/metadata/{unit_type}")
+async def get_metadata(unit_type: str, conn=Depends(get_db)):
+    """Returns unique values for filterable columns based on unit type."""
+    table_name = TABLE_MAPPING.get(unit_type)
+    if not table_name:
+        logger.error(f"No such table {table_name}")
+        raise HTTPException(status_code=400, detail="Invalid unit_type")
     
-    # Convert all values to string to avoid JSON serialization errors
-    properties = {str(k): str(v) for k, v in unit.items() if k not in [lat_col, lon_col]}
-    properties['unit_type'] = unit_type
+    cols = FILTER_COLUMNS.get("common", []) + FILTER_COLUMNS.get(unit_type, [])
+    metadata = {}
     
-    return {
-        "type": "Feature",
-        "geometry": {
-            "type": "Point",
-            "coordinates": [float(unit[lon_col]), float(unit[lat_col])]
-        },
-        "properties": properties
-    }
-
-
-@app.get("/api/tables", response_model=Dict[str, Any])
-async def get_tables(conn=Depends(get_db)):
     try:
-        query = '''
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-        '''
-
-        units = await conn.fetch(query)
-
-        # Convert records to list of dicts for JSON serialization
-        return {"tables": [dict(record) for record in units]}
+        for col in cols:
+            query = f'SELECT DISTINCT "{col}" FROM "{table_name}" WHERE "{col}" IS NOT NULL ORDER BY 1'
+            records = await conn.fetch(query)
+            metadata[col] = [r[col] for r in records]
+        return metadata
     except Exception as e:
-        logger.error(f"Error fetching tables: {e}")
-        raise HTTPException(status_code=500, detail="Internal error")
+        logger.error(f"Error getting metadata: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/units", response_model=Dict[str, Any])
-async def get_units(conn=Depends(get_db),
-                    unit_type: str = Query(..., description="Type of unit to retrieve"),
-    min_lat: Optional[float] = Query(None),
-    min_lon: Optional[float] = Query(None),
-    max_lat: Optional[float] = Query(None),
-    max_lon: Optional[float] = Query(None),
-    limit: Optional[int] = Query(5000, description="Maximum number of units")):
-    table_mapping = {
-        "solar": "solar_extended",
-        "wind": "wind_extended",
-        "storage": "storage_extended",
-        "biomass": "biomass_extended",
-        "hydro": "hydro_extended",
-        "combustion": "combustion_extended",
-        "nuclear": "nuclear_extended",
-    }
-    table_name = table_mapping.get(unit_type)
+@app.get("/api/tiles/{unit_type}/{z}/{x}/{y}")
+async def get_tiles(
+    unit_type: str, z: int, x: int, y: int, 
+    request: Request,
+    conn=Depends(get_db)
+):
+    table_name = TABLE_MAPPING.get(unit_type)
+    if not table_name:
+        return Response(content=b"", media_type="application/vnd.mapbox-vector-tile")
+
+    # Dynamic Filtering from query params
+    params = [z, x, y]
+    where_clauses = ['geom && ST_Transform(ST_TileEnvelope($1, $2, $3), 4326)']
+    
+    # Extract all filters from query params that match our filterable columns
+    allowed_cols = FILTER_COLUMNS["common"] + FILTER_COLUMNS.get(unit_type, [])
+    for key, value in request.query_params.items():
+        if key in allowed_cols and value:
+            vals = value.split(',')
+            placeholders = [f'${len(params) + i + 1}' for i in range(len(vals))]
+            where_clauses.append(f'"{key}" IN ({", ".join(placeholders)})')
+            params.extend(vals)
+
+    where_sql = " AND ".join(where_clauses)
+    query = f"""
+        WITH mvtgeom AS (
+            SELECT "EinheitMastrNummer", "NameStromerzeugungseinheit" as "Name",
+                   "Bruttoleistung", "Bundesland", "EinheitBetriebsstatus",
+                ST_AsMVTGeom(ST_Transform(geom, 3857), ST_TileEnvelope($1, $2, $3), 4096, 256, true) AS geom
+            FROM "{table_name}" WHERE {where_sql}
+        )
+        SELECT ST_AsMVT(mvtgeom.*, 'layer', 4096, 'geom') FROM mvtgeom;
+    """
+    try:
+        result = await conn.fetchval(query, *params)
+        return Response(content=result if result else b"", media_type="application/vnd.mapbox-vector-tile")
+    except Exception as e:
+        logger.error(f"Error generating tiles: {e}")
+        return Response(content=b"", media_type="application/vnd.mapbox-vector-tile")
+
+@app.get("/api/stats/advanced/{unit_type}")
+async def get_advanced_stats(unit_type: str, conn=Depends(get_db)):
+    """Returns temporal growth and categorical breakdown stats."""
+    table_name = TABLE_MAPPING.get(unit_type)
     if not table_name:
         raise HTTPException(status_code=400, detail="Invalid unit_type")
 
     try:
-        query = f'''
-            SELECT "EinheitMastrNummer", "Breitengrad", "Laengengrad",
-                   "NameStromerzeugungseinheit" as "Name"
+        # Temporal Stats (Growth by Year)
+        query_temporal = f"""
+            SELECT EXTRACT(YEAR FROM "Inbetriebnahmedatum")::int as year,
+                   COUNT(*) as count, SUM("Bruttoleistung") as capacity
             FROM "{table_name}"
-            WHERE "Laengengrad" IS NOT NULL AND "Breitengrad" IS NOT NULL
-        '''
-        params = []
+            WHERE "Inbetriebnahmedatum" IS NOT NULL
+            GROUP BY year ORDER BY year
+        """
+        
+        # Status Breakdown
+        query_status = f"""
+            SELECT "EinheitBetriebsstatus" as status, COUNT(*) as count
+            FROM "{table_name}" GROUP BY status
+        """
 
-        if all([min_lat, min_lon, max_lat, max_lon]):
-            query += ' AND "Breitengrad" BETWEEN $1 AND $2 AND "Laengengrad" BETWEEN $3 AND $4'
-            params = [min_lat, max_lat, min_lon, max_lon]
+        # Main Category Breakdown (Table specific)
+        cat_col = FILTER_COLUMNS.get(unit_type, ["Technologie"])[0]
+        query_cat = f"""
+            SELECT "{cat_col}" as category, SUM("Bruttoleistung") as capacity
+            FROM "{table_name}" WHERE "{cat_col}" IS NOT NULL
+            GROUP BY category ORDER BY capacity DESC LIMIT 10
+        """
 
-        # THIS IS THE KEY CHANGE: Random order for even distribution
-        query += ' ORDER BY RANDOM()'
+        temporal = await conn.fetch(query_temporal)
+        status = await conn.fetch(query_status)
+        categories = await conn.fetch(query_cat)
 
-        if limit and limit > 0:
-            query += f' LIMIT {limit}'
-
-        units = await conn.fetch(query, *params)
-
-        features = [to_geojson_feature(dict(unit), unit_type) for unit in units]
-        feature_collection = {
-            "type": "FeatureCollection",
-            "features": list(filter(None, features))
+        return {
+            "temporal": [dict(r) for r in temporal],
+            "status": [dict(r) for r in status],
+            "categories": {"column": cat_col, "data": [dict(r) for r in categories]}
         }
-        return feature_collection
     except Exception as e:
-        logger.error(f"Error fetching units: {e}")
-        raise HTTPException(status_code=500, detail="Internal error")
+        logger.error(f"Error fetching advanced temporal stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/stats")
+async def get_basic_stats(unit_type: str, conn=Depends(get_db)):
+    try:
+        table_name = TABLE_MAPPING.get(unit_type)
+        query = f'SELECT "Bundesland", COUNT(*) as count, SUM("Bruttoleistung") as total_capacity FROM "{table_name}" WHERE "Bundesland" IS NOT NULL GROUP BY "Bundesland" ORDER BY total_capacity DESC'
+        records = await conn.fetch(query)
+        return [dict(r) for r in records]
+    except Exception as e:
+        logger.error(f"Error fetching basic stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/bundeslaender")
+async def get_bundeslaender(conn=Depends(get_db)):
+    try:
+        records = await conn.fetch('SELECT DISTINCT "Bundesland" FROM solar_extended WHERE "Bundesland" IS NOT NULL ORDER BY 1')
+        return [r["Bundesland"] for r in records]
+    except Exception as e:
+        logger.error(f"Error fetching Bundeslander: {e}")
+        raise HTTPException(status_code=500, detail=str(e))        
