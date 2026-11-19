@@ -1,0 +1,2 @@
+public/data/map.pmtiles filter=lfs diff=lfs merge=lfs -text
+public/data/units.parquet filter=lfs diff=lfs merge=lfs -text
